@@ -1,9 +1,31 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { CallStatus, WebSocketMessage, ChatMessage, WebRTCProps } from '../types';
 
+// Enhanced STUN/TURN configuration for NAT traversal
+// Add your own TURN server credentials for production
 const PEER_CONNECTION_CONFIG: RTCConfiguration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    // Uncomment and add your TURN server credentials for production:
+    // {
+    //   urls: 'turn:your-turn-server.com:3478',
+    //   username: 'your-username',
+    //   credential: 'your-password'
+    // },
+    // Xirsys TURN example:
+    // {
+    //   urls: ['turn:turn.example.com:3478?transport=udp', 'turn:turn.example.com:3478?transport=tcp'],
+    //   username: 'username',
+    //   credential: 'password'
+    // }
+  ],
+  iceCandidatePoolSize: 10
 };
+
+const KEEPALIVE_INTERVAL = 25000; // 25 seconds
+const RECONNECT_DELAYS = [2000, 4000, 8000, 16000]; // Exponential backoff
 
 export const useWebRTC = (serverUrl: string): WebRTCProps => {
   const [status, setStatus] = useState<CallStatus>('idle');
@@ -12,19 +34,43 @@ export const useWebRTC = (serverUrl: string): WebRTCProps => {
   const [isMuted, setIsMuted] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isChatOpen, setIsChatOpen] = useState(false);
-  
+
   const ws = useRef<WebSocket | null>(null);
   const pc = useRef<RTCPeerConnection | null>(null);
   const localStream = useRef<MediaStream | null>(null);
   const remoteAudio = useRef<HTMLAudioElement | null>(null);
   const dataChannel = useRef<RTCDataChannel | null>(null);
   const userId = useRef<string>(crypto.randomUUID());
+  const keepaliveTimer = useRef<number | null>(null);
+  const reconnectAttempts = useRef<number>(0);
+  const reconnectTimer = useRef<number | null>(null);
 
   // Ref to hold startSearch function to break dependency cycle
   const startSearchRef = useRef<() => void>();
 
   const getFlag = useCallback((code: string): string => {
     return String.fromCodePoint(...[...code.toUpperCase()].map(c => 127397 + c.charCodeAt(0)));
+  }, []);
+
+  // Start keepalive mechanism
+  const startKeepalive = useCallback(() => {
+    if (keepaliveTimer.current) {
+      clearInterval(keepaliveTimer.current);
+    }
+
+    keepaliveTimer.current = window.setInterval(() => {
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, KEEPALIVE_INTERVAL);
+  }, []);
+
+  // Stop keepalive mechanism
+  const stopKeepalive = useCallback(() => {
+    if (keepaliveTimer.current) {
+      clearInterval(keepaliveTimer.current);
+      keepaliveTimer.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -40,13 +86,17 @@ export const useWebRTC = (serverUrl: string): WebRTCProps => {
 
     remoteAudio.current = new Audio();
     remoteAudio.current.autoplay = true;
-    
+
     return () => {
+      stopKeepalive();
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current);
+      }
       ws.current?.close();
       pc.current?.close();
       localStream.current?.getTracks().forEach(track => track.stop());
     };
-  }, [getFlag]);
+  }, [getFlag, stopKeepalive]);
 
   const setupDataChannelEvents = useCallback(() => {
     if (!dataChannel.current) return;
@@ -130,10 +180,33 @@ export const useWebRTC = (serverUrl: string): WebRTCProps => {
       
       pc.current.onconnectionstatechange = () => {
         const state = pc.current?.connectionState;
-        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
-           if(status !== 'disconnected') {
-              hangUp(true); // Assuming auto-next on unexpected disconnect
-           }
+        console.log(`RTCPeerConnection state: ${state}`);
+
+        if (state === 'connected') {
+          reconnectAttempts.current = 0; // Reset on successful connection
+        } else if (state === 'disconnected') {
+          console.warn('Connection disconnected, attempting reconnection...');
+          attemptReconnect();
+        } else if (state === 'failed') {
+          console.error('Connection failed, attempting reconnection...');
+          attemptReconnect();
+        } else if (state === 'closed') {
+          if (status !== 'disconnected' && status !== 'idle') {
+            hangUp(true);
+          }
+        }
+      };
+
+      pc.current.oniceconnectionstatechange = () => {
+        const iceState = pc.current?.iceConnectionState;
+        console.log(`ICE connection state: ${iceState}`);
+
+        if (iceState === 'failed' || iceState === 'disconnected') {
+          // ICE restart attempt
+          if (pc.current && pc.current.restartIce) {
+            console.log('Attempting ICE restart...');
+            pc.current.restartIce();
+          }
         }
       };
       
@@ -187,15 +260,48 @@ export const useWebRTC = (serverUrl: string): WebRTCProps => {
     }
   };
 
+  // Reconnection logic with exponential backoff
+  const attemptReconnect = useCallback(() => {
+    if (reconnectAttempts.current >= RECONNECT_DELAYS.length) {
+      console.error('Max reconnection attempts reached');
+      hangUp(false);
+      return;
+    }
+
+    const delay = RECONNECT_DELAYS[reconnectAttempts.current];
+    console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts.current + 1}/${RECONNECT_DELAYS.length})`);
+
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+    }
+
+    reconnectTimer.current = window.setTimeout(() => {
+      reconnectAttempts.current += 1;
+
+      // Send reconnect message to server
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: 'reconnect' }));
+      } else {
+        // If WebSocket is closed, restart search
+        startSearchRef.current?.();
+      }
+    }, delay);
+  }, [hangUp]);
+
   const connectWebSocket = useCallback(() => {
     ws.current = new WebSocket(serverUrl);
-    
-    ws.current.onopen = () => console.log('WebSocket connected');
+
+    ws.current.onopen = () => {
+      console.log('✅ WebSocket connected');
+      reconnectAttempts.current = 0; // Reset reconnection attempts
+      startKeepalive(); // Start keepalive
+    };
 
     ws.current.onmessage = async (event) => {
       const message: WebSocketMessage = JSON.parse(event.data);
       switch(message.type) {
         case 'match':
+          console.log('✅ Match found with partner from', message.country);
           setPartnerCountry(message.country || '🏳️');
           setStatus('connecting');
           await createPeerConnectionAndOffer();
@@ -203,24 +309,50 @@ export const useWebRTC = (serverUrl: string): WebRTCProps => {
         case 'signal':
           await handleSignal(message.data);
           break;
+        case 'pong':
+          // Keepalive response received
+          break;
+        case 'searching':
+          console.log('🔍 Searching for match...');
+          break;
+        case 'partnerDisconnected':
+          console.log('⚠️  Partner disconnected');
+          hangUp(true);
+          break;
+        case 'serverShutdown':
+          console.warn('⚠️  Server shutting down');
+          setStatus('disconnected');
+          stopKeepalive();
+          break;
+        case 'timeout':
+          console.warn('⏰ Matching timeout - no partner found');
+          setStatus('idle');
+          break;
       }
     };
     
     ws.current.onclose = () => {
-      console.log('WebSocket disconnected');
+      console.log('⚠️  WebSocket disconnected');
+      stopKeepalive();
+
       if (status !== 'idle') {
         setStatus('disconnected');
+        // Attempt to reconnect if not intentionally closed
+        if (reconnectAttempts.current < RECONNECT_DELAYS.length) {
+          attemptReconnect();
+        }
       }
       cleanupPeerConnection();
     };
 
     ws.current.onerror = (error) => {
-      console.error('WebSocket error:', error);
+      console.error('❌ WebSocket error:', error);
+      stopKeepalive();
       setStatus('disconnected');
       cleanupPeerConnection();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverUrl, status]);
+  }, [serverUrl, status, startKeepalive, stopKeepalive, attemptReconnect]);
   
   const startSearch = useCallback(() => {
     if (ws.current?.readyState !== WebSocket.OPEN) {

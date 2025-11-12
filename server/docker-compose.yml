@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  airtalk-server:
+    build: .
+    container_name: airtalk-signaling-server
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - ALLOWED_ORIGINS=http://localhost:5173,https://yourdomain.com
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - airtalk-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: airtalk-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - airtalk-network
+
+networks:
+  airtalk-network:
+    driver: bridge
+
+volumes:
+  redis-data:
