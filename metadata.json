@@ -1,0 +1,7 @@
+{
+  "name": "AirTalk - Voice Chat with Strangers",
+  "description": "A web application that lets you connect instantly with strangers around the world through real-time, voice-only conversations. No registration, no profiles, no distractions – just your voice and someone else's.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
